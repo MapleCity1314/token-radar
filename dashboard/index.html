@@ -2,19 +2,70 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Token Launch Radar</title>
   <link rel="stylesheet" href="app.css">
 </head>
 <body>
   <main class="shell">
-    <header class="hero"><div><p class="eyebrow">TOKEN LAUNCH RADAR · SNAPSHOT <span id="asOf"></span></p><h1>Find the protocols<br><em>before the token.</em></h1><p class="lede">A deterministic board for pre-token protocols with enough onchain activity to earn a measured place in your farm plan.</p></div><div class="hero-stat"><span id="boardCount">0</span><small>ranked protocols</small></div></header>
-    <section class="controls" aria-label="Board filters"><label>Search<input id="search" type="search" placeholder="Name or slug"></label><label>Category<select id="category"><option value="">All categories</option></select></label><label>Chain<select id="chain"><option value="">All chains</option></select></label><label>Status<select id="status"><option value="">All statuses</option><option value="pre-token">Pre-token</option><option value="token-bearing">Token-bearing</option></select></label><label>Min implied value<input id="minValue" type="number" min="0" step="1000" placeholder="0"></label><button id="clear" type="button">Clear filters</button></section>
+    <header class="hero">
+      <div>
+        <p class="eyebrow">TOKEN LAUNCH RADAR · SNAPSHOT <span id="asOf"></span></p>
+        <h1>Find the protocols<br><em>before the token.</em></h1>
+        <p class="lede">A deterministic board for pre-token protocols with a transparent value model and a seven-step farm plan.</p>
+      </div>
+      <div class="hero-stat"><span id="boardCount">0</span><small>ranked protocols</small></div>
+    </header>
+
+    <section class="facts" aria-label="Snapshot facts">
+      <article><strong id="coverageFact">0 / 0</strong><span>watchlist covered</span></article>
+      <article><strong id="rankedFact">0</strong><span>ranked rows</span></article>
+      <article><strong id="earlyFact">0</strong><span>early below floor</span></article>
+      <article><strong id="supplementalFact">0</strong><span>supplemental above floor</span></article>
+      <article><strong id="liveFact">0</strong><span>live-token rows</span></article>
+    </section>
+
+    <nav class="tabs" role="tablist" aria-label="Protocol views">
+      <button id="boardTab" role="tab" aria-controls="boardPanel" aria-selected="true" type="button">Pre-token board</button>
+      <button id="liveTab" role="tab" aria-controls="livePanel" aria-selected="false" type="button">Live token</button>
+    </nav>
+
+    <section class="controls" aria-label="Protocol filters">
+      <label>Search<input id="search" type="search" placeholder="Name or slug" autocomplete="off"></label>
+      <label>Category<select id="category"><option value="">All categories</option></select></label>
+      <label>Chain<select id="chain"><option value="">All chains</option></select></label>
+      <label>Min implied value<input id="minValue" type="number" min="0" step="1000" placeholder="0"></label>
+      <label>Sort<select id="sort"><option value="rank">Rank</option><option value="name">Protocol</option><option value="category">Category</option><option value="tvl_usd">TVL</option><option value="change_7d">7d change</option><option value="age_days">Age</option><option value="implied_value_usd">Implied value</option></select></label>
+      <button id="clear" type="button">Clear filters</button>
+    </section>
+
     <section class="filter-state"><strong id="resultCount">0 results</strong><span id="filterSummary">All ranked protocols</span></section>
-    <section class="board-wrap"><table aria-label="Ranked pre-token protocols"><thead><tr><th data-key="rank">Rank</th><th data-key="name">Protocol</th><th data-key="category">Category</th><th>Chains</th><th data-key="tvl_usd">TVL</th><th data-key="change_7d">7d</th><th data-key="age_days">Age</th><th data-key="implied_value_usd">Implied value</th><th>Status</th></tr></thead><tbody id="board"></tbody></table><div id="empty" class="empty" hidden>No protocols match these filters.</div></section>
-    <section class="market"><div class="section-heading"><div><p class="eyebrow">SEPARATE VIEW</p><h2>Live market context</h2></div><p>Token-bearing protocols are shown for context and are never mixed into the ranking.</p></div><div id="marketGrid" class="market-grid"></div></section>
-    <section id="detail" class="detail" hidden><button id="back" type="button" class="back">← Back to board</button><div id="detailContent"></div></section>
+
+    <section id="boardPanel" class="table-panel" role="tabpanel" aria-labelledby="boardTab">
+      <div class="table-heading"><h2>Pre-token board</h2><span id="boardSource">200 ranked rows</span></div>
+      <div class="table-wrap"><table id="boardTable" aria-label="Ranked pre-token protocols"><thead></thead><tbody></tbody></table><div id="boardEmpty" class="empty" hidden>No protocols match these filters.</div></div>
+    </section>
+
+    <section id="livePanel" class="table-panel" role="tabpanel" aria-labelledby="liveTab" hidden>
+      <div class="table-heading"><h2>Live token rows</h2><span id="liveSource">0 rows</span></div>
+      <div class="table-wrap"><table id="liveTable" aria-label="Live token protocols"><thead></thead><tbody></tbody></table><div id="liveEmpty" class="empty" hidden>No live rows match these filters.</div></div>
+    </section>
+
+    <section class="model-panel" aria-labelledby="modelTitle">
+      <div><p class="eyebrow">MODEL <span id="modelVersion"></span></p><h2 id="modelTitle">Nonlinear family and risk model</h2></div>
+      <p>Implied value = TVL × <code>0.25</code> × category factor × growth factor × downside factor × age factor. Growth is clamped to -60%…120%, category factor uses family medians, positive growth is bounded by tanh, negative growth receives a separate downside deduction, and age follows a diminishing-return curve.</p>
+      <p class="model-note">Family buckets are lending, dex, derivatives, restaking, bridge, vault, yield, and general. The dashboard recomputes the formula from every row’s stored inputs before showing detail.</p>
+    </section>
   </main>
-  <script src="../data.js"></script><script src="app.js"></script>
+
+  <aside id="drawer" class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawerTitle" hidden>
+    <div class="drawer-inner">
+      <button id="closeDrawer" class="close" type="button" aria-label="Close protocol detail">×</button>
+      <div id="detailContent"></div>
+    </div>
+  </aside>
+
+  <script src="../data.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>

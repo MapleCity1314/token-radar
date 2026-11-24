@@ -11,122 +11,270 @@ export interface SnapshotProtocol {
   symbol: string | null;
 }
 
+export interface SnapshotInput {
+  as_of: string;
+  floor_usd: number;
+  protocols: SnapshotProtocol[];
+  watchlist: string[];
+}
+
 export interface BoardRow extends SnapshotProtocol {
+  rank: number;
   token_status: 'pre-token';
+  watchlist: boolean;
+  selection_group: 'watchlist' | 'early-below-floor' | 'supplemental';
   age_days: number;
   growth_pct: number;
-  growth_multiplier: number;
-  age_multiplier: number;
-  status_multiplier: number;
+  category_bucket: string;
+  category_median_pct: number;
+  global_median_pct: number;
+  category_factor: number;
+  growth_factor: number;
+  downside_factor: number;
+  age_factor: number;
+  categoryFactor: number;
+  growthFactor: number;
+  downsideFactor: number;
+  ageFactor: number;
   implied_value_usd: number;
+  capital_usd: number;
+  hold_days: number;
+  cadence: string;
   farm_steps: string[];
-  rank: number;
 }
 
 export interface LiveRow extends SnapshotProtocol {
+  rank: number;
   token_status: 'token-bearing';
   age_days: number;
   growth_pct: number;
+  category_bucket: string;
+  category_factor: number;
+  growth_factor: number;
+  downside_factor: number;
+  age_factor: number;
+  implied_value_usd: number;
 }
 
-const DAY = 86_400_000;
-const categories = {
-  lending: ['lending', 'credit', 'cdp', 'money market'],
-  dex: ['dex', 'amm', 'spot', 'order book'],
-  derivatives: ['derivative', 'perp', 'options', 'futures'],
-  restaking: ['restaking', 'liquid staking', 'staking pool', 'staking'],
-  bridge: ['bridge', 'cross chain'],
-  vault: ['vault', 'allocator', 'curator', 'liquidity manager'],
-  yield: ['yield', 'farm', 'basis', 'synthetic'],
+export interface BoardStats {
+  watchlist_size: number;
+  watchlist_covered: number;
+  board_size: number;
+  early_size: number;
+  supplemental_size: number;
+  supplemental_above_floor: number;
+  supplemental_below_floor: number;
+  live_size: number;
+  cex_count: number;
+  versioned_count: number;
+  product_filtered_count: number;
+  early_below_floor_available: number;
+}
+
+export const MODEL_VERSION = 'v2-nonlinear-family-risk-age';
+
+// categoryFactor 使用 lending、dex、derivatives、restaking、bridge、vault、yield 七个
+// family bucket，无法归入这些 family 的原始 category 使用 general。这样每个中位数都在
+// family 级别聚合，避免 raw category 只有一两行时产生不稳定的基准。
+export const MODEL_CONSTANTS = {
+  tvl_weight: 0.25,
+  growth_weight: 0.2,
+  growth_scale: 20,
+  downside_weight: 0.2,
+  downside_cap: 60,
+  age_floor: 0.55,
+  age_horizon_days: 1095,
+  age_default_days: 365,
+  category_delta: 0.2,
+  category_min: 0.9,
+  category_max: 1.1,
+  growth_min: -60,
+  growth_max: 120,
+  capital_rounding: 25,
+  model_version: MODEL_VERSION,
+  family_buckets: ['lending', 'dex', 'derivatives', 'restaking', 'bridge', 'vault', 'yield', 'general'],
+} as const;
+
+const PRODUCT_CATEGORIES = new Set(['cex', 'bridge', 'canonical bridge', 'liquid staking', 'liquid restaking', 'restaked btc']);
+const VERSIONED_NAME = /\s(?:V\d+(?:\.\d+)?|v\d+(?:\.\d+)?|\d+\.\d+)$/;
+const PRODUCT_WORD = /\b(?:wrapped|staked|staking)\b/i;
+const DAY_MS = 86_400_000;
+
+const clamp = (value: number, min: number, max: number): number => Math.min(max, Math.max(min, value));
+
+const median = (values: number[]): number => {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[middle]! : (sorted[middle - 1]! + sorted[middle]!) / 2;
 };
 
-function family(category: string): keyof typeof categories | 'general' {
-  const c = category.toLowerCase();
-  for (const [key, terms] of Object.entries(categories)) {
-    if (terms.some((term) => c.includes(term))) return key as keyof typeof categories;
-  }
+export const familyForCategory = (category: string): string => {
+  const value = category.toLowerCase();
+  if (value.includes('lending') || value.includes('cdp') || value.includes('collateral')) return 'lending';
+  if (value.includes('dex') || value.includes('swap') || value.includes('exchange')) return 'dex';
+  if (value.includes('derivative') || value.includes('option') || value.includes('synthetic') || value.includes('basis') || value.includes('leveraged') || value.includes('prediction')) return 'derivatives';
+  if (value.includes('restak') || value.includes('staking') || value.includes('staked')) return 'restaking';
+  if (value.includes('bridge')) return 'bridge';
+  if (value.includes('vault') || value.includes('curator') || value.includes('allocator')) return 'vault';
+  if (value.includes('yield') || value.includes('farm') || value.includes('liquidity manager')) return 'yield';
   return 'general';
-}
+};
 
-function ageDays(asOf: string, listedAt: string | null): number {
-  const end = Date.parse(`${asOf}T00:00:00Z`);
-  const start = listedAt ? Date.parse(`${listedAt}T00:00:00Z`) : Number.NaN;
-  if (!Number.isFinite(end) || !Number.isFinite(start)) return 365;
-  return Math.max(0, Math.floor((end - start) / DAY));
-}
+const isPreToken = (record: SnapshotProtocol): boolean => record.gecko_id == null && record.symbol == null;
+const isVersioned = (record: SnapshotProtocol): boolean => VERSIONED_NAME.test(record.name);
+const isRankable = (record: SnapshotProtocol): boolean => isPreToken(record) && record.category !== 'CEX' && !isVersioned(record);
+const isProductFiltered = (record: SnapshotProtocol): boolean => PRODUCT_CATEGORIES.has(record.category.toLowerCase()) || PRODUCT_WORD.test(record.name);
 
-function modelInputs(p: SnapshotProtocol, asOf: string) {
-  const age_days = ageDays(asOf, p.listed_at);
-  const growth_pct = p.change_7d == null ? 0 : Math.max(-60, Math.min(120, p.change_7d));
-  const growth_multiplier = 1 + 0.4 * growth_pct / 100;
-  const age_multiplier = 0.7 + 0.3 * Math.min(age_days, 1095) / 1095;
-  const status_multiplier = p.gecko_id === null && p.symbol === null ? 1 : 0.55;
-  const implied_value_usd = Math.max(1, Math.round(p.tvl_usd * 0.3 * growth_multiplier * age_multiplier * status_multiplier));
-  return { age_days, growth_pct, growth_multiplier, age_multiplier, status_multiplier, implied_value_usd };
-}
+const ageDaysFor = (record: SnapshotProtocol, asOf: string): number => {
+  const listedMs = record.listed_at === null ? Number.NaN : Date.parse(`${record.listed_at}T00:00:00Z`);
+  const asOfMs = Date.parse(`${asOf}T00:00:00Z`);
+  if (!Number.isFinite(listedMs) || !Number.isFinite(asOfMs)) return MODEL_CONSTANTS.age_default_days;
+  return Math.max(0, Math.floor((asOfMs - listedMs) / DAY_MS));
+};
 
-function money(n: number): string {
-  if (n < 1) return '$0';
-  if (n < 1000) return `$${Math.round(n)}`;
-  return `$${Math.round(n / 100) * 100}`;
-}
+const growthFor = (record: SnapshotProtocol): number => clamp(typeof record.change_7d === 'number' ? record.change_7d : 0, MODEL_CONSTANTS.growth_min, MODEL_CONSTANTS.growth_max);
 
-function templates(kind: keyof typeof categories | 'general', p: SnapshotProtocol, model: ReturnType<typeof modelInputs>): string[] {
-  const chain = p.chains[0] ?? 'the first supported chain';
-  const base = Math.max(4, Math.min(45, Math.round(Math.log10(Math.max(10, p.tvl_usd)) * 2)));
-  const cadence = model.age_days < 45 ? 'within 48 hours' : 'once each week';
-  const common = [
-    `Set up and verify — Open ${p.name} on ${chain}, connect a fresh wallet, and record the exact network and contract shown for ${p.slug}. Expected cost ${money(base)} for gas and setup. Time requirement 15–25 minutes.`,
-    `Start with a measured position — Use a test-sized position of $${Math.max(25, base * 5)} in ${p.name} and keep the transaction hash, amount, and block time in a tracker. Expected cost ${money(base + 2)} including network fees. Time requirement 20–35 minutes.`,
-    `Repeat and document — Review ${p.name} ${cadence}, compare balance and risk settings with the prior entry, and save a dated screenshot or export. Expected cost ${money(Math.max(0, base - 2))} for observation and gas. Time requirement 10–20 minutes.`,
-    `Record a claim-ready trail — Keep wallet address, ${p.slug} page, action hashes, deposited value, and withdrawal status together so any future points or launch claim can be checked from primary evidence. Expected cost $0. Time requirement 10–15 minutes.`,
+const factorInputs = (record: SnapshotProtocol, asOf: string, familyMedians: Map<string, number>, globalMedian: number) => {
+  const age_days = ageDaysFor(record, asOf);
+  const growth_pct = growthFor(record);
+  const category_bucket = familyForCategory(record.category);
+  const category_median_pct = familyMedians.get(category_bucket) ?? globalMedian;
+  const category_factor = clamp(1 + MODEL_CONSTANTS.category_delta * (category_median_pct - globalMedian) / 100, MODEL_CONSTANTS.category_min, MODEL_CONSTANTS.category_max);
+  const growth_factor = 1 + MODEL_CONSTANTS.growth_weight * Math.tanh(growth_pct / MODEL_CONSTANTS.growth_scale);
+  const downside_factor = 1 - MODEL_CONSTANTS.downside_weight * Math.max(0, -growth_pct) / MODEL_CONSTANTS.downside_cap;
+  const agePart = 1 - Math.exp(-Math.min(age_days, MODEL_CONSTANTS.age_horizon_days) / 365);
+  const ageFactorPart = 1 - Math.exp(-MODEL_CONSTANTS.age_horizon_days / 365);
+  const age_factor = MODEL_CONSTANTS.age_floor + (1 - MODEL_CONSTANTS.age_floor) * agePart / ageFactorPart;
+  return { age_days, growth_pct, category_bucket, category_median_pct, global_median_pct: globalMedian, category_factor, growth_factor, downside_factor, age_factor };
+};
+
+const impliedValue = (tvl_usd: number, factors: Pick<BoardRow, 'category_factor' | 'growth_factor' | 'downside_factor' | 'age_factor'>): number => Math.max(1, Math.round(tvl_usd * MODEL_CONSTANTS.tvl_weight * factors.category_factor * factors.growth_factor * factors.downside_factor * factors.age_factor));
+
+const roundTo25 = (value: number): number => Math.round(value / MODEL_CONSTANTS.capital_rounding) * MODEL_CONSTANTS.capital_rounding;
+
+const farmActionFor = (family: string): string => {
+  if (family === 'lending') return 'supply a small stablecoin position and test one reversible borrow';
+  if (family === 'dex') return 'complete one small swap, then add a reversible liquidity position';
+  if (family === 'derivatives') return 'open a small collateralized position and record the risk screen';
+  if (family === 'restaking') return 'stake or restake a small amount and record the withdrawal queue';
+  if (family === 'bridge') return 'make a small reversible cross-chain transfer and confirm arrival';
+  if (family === 'vault') return 'deposit a small amount into the primary vault and save its terms';
+  if (family === 'yield') return 'make a small deposit or farm action and record the reward route';
+  return 'use the primary protocol entry point for one small reversible action';
+};
+
+const farmStepsFor = (record: SnapshotProtocol, factors: ReturnType<typeof factorInputs>): { steps: string[]; capital_usd: number; hold_days: number; cadence: string } => {
+  const baseCapital = record.tvl_usd >= 5_000_000_000 ? 250 : record.tvl_usd >= 1_000_000_000 ? 150 : record.tvl_usd >= 100_000_000 ? 100 : 50;
+  const capital = roundTo25(Math.min(baseCapital, factors.growth_pct < -15 ? 50 : factors.age_days < 90 ? 75 : baseCapital));
+  const hold_days = factors.age_days < 90 ? 60 : factors.age_days < 365 ? 45 : 30;
+  const cadence = factors.age_days < 45 ? 'every 48 hours' : 'every 7 days';
+  const gas = 'the first network gas fee';
+  const action = farmActionFor(factors.category_bucket);
+  const steps = [
+    `1. Confirm ${record.name}, its ${record.category} category, chain entry, official route, slug ${record.slug}, and the fresh wallet address. Cost: ${gas}. Time: 5-10 minutes.`,
+    `2. ${action}. Use a test amount of $${capital} capital and keep the action reversible. Cost: $${capital} capital plus network gas. Time: 15-45 minutes.`,
+    `3. Complete a second verifiable action in the same protocol, save the transaction hash, and record the resulting balance or position. Cost: network gas. Time: 10-20 minutes.`,
+    `4. Recheck the TVL page, wallet balance, reward asset, and transaction record on a ${cadence} cadence. Cost: one review gas fee when a transaction is needed. Time: 10 minutes.`,
+    `5. Hold the position for at least ${hold_days} days while tracking the seven-day change. ${factors.growth_pct < -15 ? 'Pause adding capital and review exit conditions while growth is below -15%.' : 'Add no capital until the next scheduled review is complete.'} Cost: $${capital} capital held. Time: ${hold_days} days.`,
+    `6. Check the protocol points or rewards page for eligibility, snapshot timing, claim route, and lock period. Save the page date and any qualification evidence. Cost: $0 unless the page shows a fee. Time: 10 minutes.`,
+    `7. Check withdrawal, slippage, exit fee, and bridge arrival before exiting. Withdraw, then archive the wallet, date, amount, transaction hash, and result. Cost: exit gas and any displayed fee. Time: 15-30 minutes.`,
   ];
-  const specialized: Record<string, string[]> = {
-    lending: [`Supply or borrow — Supply a small stablecoin amount to ${p.name}; if collateral rules allow, test one conservative borrow and immediately note health factor and repayment path. Expected cost ${money(base + 3)} in capital and gas. Time requirement 25–40 minutes.`],
-    dex: [`Provide useful liquidity — Make one small swap on ${p.name}, then add a narrow, reversible liquidity position only if the pool shows adequate volume. Expected cost ${money(base + 4)} for swap, LP capital, and gas. Time requirement 30–45 minutes.`],
-    derivatives: [`Run a bounded trade test — Read ${p.name} funding, margin, and liquidation rules, then place a minimal isolated position with a written stop and close it in the same session. Expected cost ${money(base + 5)} for margin and fees. Time requirement 30–50 minutes.`],
-    restaking: [`Stake and inspect withdrawal — Stake a small amount through ${p.name}, capture validator or operator selection, and verify the displayed withdrawal queue before adding more. Expected cost ${money(base + 3)} for gas and stake movement. Time requirement 25–40 minutes.`],
-    bridge: [`Bridge a small amount — Bridge a test amount from ${chain} to the next supported chain, record source and destination hashes, and confirm the received balance before repeating. Expected cost ${money(base + 6)} for bridge and gas. Time requirement 35–60 minutes.`],
-    vault: [`Deposit and inspect strategy — Deposit a measured amount into ${p.name}, read the strategy and withdrawal notice, then verify share price and exit quote before increasing exposure. Expected cost ${money(base + 3)} for deposit and gas. Time requirement 25–45 minutes.`],
-    yield: [`Test the yield loop — Complete one small deposit or farm action on ${p.name}, record displayed APY, lock period, reward asset, and exit fee, then schedule the next check. Expected cost ${money(base + 4)} for capital and gas. Time requirement 30–45 minutes.`],
-    general: [`Map the core action — Identify the primary deposit, swap, stake, or service action exposed by ${p.name}, complete it with a capped amount, and save the fee and receipt. Expected cost ${money(base + 2)} in gas or service fees. Time requirement 20–35 minutes.`],
+  for (const step of steps) if (step.length < 20 || step.length > 600 || !step.includes('Cost:') || !step.includes('Time:')) throw new Error(`Invalid farm step for ${record.slug}`);
+  return { steps, capital_usd: capital, hold_days, cadence };
+};
+
+const rowFromRecord = (record: SnapshotProtocol, asOf: string, familyMedians: Map<string, number>, globalMedian: number, selection_group: BoardRow['selection_group'], watchlist: boolean): BoardRow => {
+  const factors = factorInputs(record, asOf, familyMedians, globalMedian);
+  const implied_value_usd = impliedValue(record.tvl_usd, factors);
+  const farm = farmStepsFor(record, factors);
+  return { ...record, rank: 0, token_status: 'pre-token', watchlist, selection_group, ...factors, categoryFactor: factors.category_factor, growthFactor: factors.growth_factor, downsideFactor: factors.downside_factor, ageFactor: factors.age_factor, implied_value_usd, capital_usd: farm.capital_usd, hold_days: farm.hold_days, cadence: farm.cadence, farm_steps: farm.steps };
+};
+
+const liveRowFromRecord = (record: SnapshotProtocol, asOf: string, familyMedians: Map<string, number>, globalMedian: number, rank: number): LiveRow => {
+  const factors = factorInputs(record, asOf, familyMedians, globalMedian);
+  return { ...record, rank, token_status: 'token-bearing', ...factors, implied_value_usd: impliedValue(record.tvl_usd, factors) };
+};
+
+export const buildBoard = (input: SnapshotInput): { rows: BoardRow[]; live_market: LiveRow[]; stats: BoardStats; model: typeof MODEL_CONSTANTS } => {
+  const records = input.protocols;
+  const bySlug = new Map(records.map((record) => [record.slug, record]));
+  const watchlistSet = new Set(input.watchlist);
+  const rankable = records.filter(isRankable);
+  const eligibleForStats = rankable;
+  const globalMedian = median(eligibleForStats.map((record) => growthFor(record)));
+  const valuesByFamily = new Map<string, number[]>();
+  for (const record of eligibleForStats) {
+    const family = familyForCategory(record.category);
+    const values = valuesByFamily.get(family) ?? [];
+    values.push(growthFor(record));
+    valuesByFamily.set(family, values);
+  }
+  const familyMedians = new Map([...valuesByFamily.entries()].map(([family, values]) => [family, median(values)]));
+  const watchRecords = input.watchlist.map((slug) => {
+    const record = bySlug.get(slug);
+    if (!record) throw new Error(`Watchlist slug missing from snapshot: ${slug}`);
+    return record;
+  });
+  const earlyCapacity = 200 - watchRecords.length;
+  const earlyCandidates = rankable
+    .filter((record) => !watchlistSet.has(record.slug) && record.tvl_usd < input.floor_usd && !isProductFiltered(record))
+    .sort((a, b) => b.tvl_usd - a.tvl_usd || a.slug.localeCompare(b.slug));
+  const earlyRecords = earlyCandidates.slice(0, Math.min(160, earlyCapacity));
+  const selected = new Set([...watchRecords, ...earlyRecords].map((record) => record.slug));
+  const supplementalAboveCandidates = rankable
+    .filter((record) => !selected.has(record.slug) && record.tvl_usd >= input.floor_usd && !isProductFiltered(record))
+    .sort((a, b) => b.tvl_usd - a.tvl_usd || a.slug.localeCompare(b.slug));
+  const supplementalAboveRecords = supplementalAboveCandidates.slice(0, Math.max(0, 200 - selected.size));
+  supplementalAboveRecords.forEach((record) => selected.add(record.slug));
+  const supplementalBelowCandidates = rankable
+    .filter((record) => !selected.has(record.slug) && record.tvl_usd < input.floor_usd && !isProductFiltered(record))
+    .sort((a, b) => b.tvl_usd - a.tvl_usd || a.slug.localeCompare(b.slug));
+  const supplementalBelowRecords = supplementalBelowCandidates.slice(0, Math.max(0, 200 - selected.size));
+  const supplementalRecords = [...supplementalAboveRecords, ...supplementalBelowRecords];
+  const selectedRows = [
+    ...watchRecords.map((record) => rowFromRecord(record, input.as_of, familyMedians, globalMedian, 'watchlist', true)),
+    ...earlyRecords.map((record) => rowFromRecord(record, input.as_of, familyMedians, globalMedian, 'early-below-floor', false)),
+    ...supplementalRecords.map((record) => rowFromRecord(record, input.as_of, familyMedians, globalMedian, 'supplemental', false)),
+  ];
+  if (selectedRows.length < 100 || selectedRows.length > 200) throw new Error(`Expected between 100 and 200 selected rows, received ${selectedRows.length}`);
+  selectedRows.sort((a, b) => b.implied_value_usd - a.implied_value_usd || a.slug.localeCompare(b.slug));
+  selectedRows.forEach((row, index) => { row.rank = index + 1; });
+  const liveRecords = records.filter((record) => !isPreToken(record)).sort((a, b) => (b.mcap_usd ?? -1) - (a.mcap_usd ?? -1) || b.tvl_usd - a.tvl_usd || a.slug.localeCompare(b.slug));
+  const live_market = liveRecords.map((record, index) => liveRowFromRecord(record, input.as_of, familyMedians, globalMedian, index + 1));
+  const stats: BoardStats = {
+    watchlist_size: input.watchlist.length,
+    watchlist_covered: selectedRows.filter((row) => row.watchlist).length,
+    board_size: selectedRows.length,
+    early_size: earlyRecords.length,
+    supplemental_size: supplementalRecords.length,
+    supplemental_above_floor: supplementalAboveRecords.length,
+    supplemental_below_floor: supplementalBelowRecords.length,
+    live_size: live_market.length,
+    cex_count: selectedRows.filter((row) => row.category === 'CEX').length,
+    versioned_count: selectedRows.filter((row) => isVersioned(row)).length,
+    product_filtered_count: selectedRows.filter((row) => isProductFiltered(row)).length,
+    early_below_floor_available: earlyCandidates.length,
   };
-  return [common[0]!, specialized[kind]![0]!, common[1]!, common[2]!, common[3]!];
-}
+  return { rows: selectedRows, live_market, stats, model: MODEL_CONSTANTS };
+};
 
-export function buildBoard(snapshot: { as_of: string; floor_usd: number; protocols: SnapshotProtocol[]; watchlist: string[] }): { rows: BoardRow[]; live_market: LiveRow[] } {
-  const bySlug = new Map(snapshot.protocols.map((p) => [p.slug, p]));
-  const rankable = snapshot.protocols.filter((p) => p.gecko_id === null && p.symbol === null);
-  const selected = new Map<string, SnapshotProtocol>();
-  for (const slug of snapshot.watchlist) {
-    const p = bySlug.get(slug);
-    if (p && p.gecko_id === null && p.symbol === null) selected.set(slug, p);
-  }
-  const below = rankable.filter((p) => p.tvl_usd < snapshot.floor_usd && !selected.has(p.slug)).sort((a, b) => b.tvl_usd - a.tvl_usd || a.slug.localeCompare(b.slug));
-  for (const p of below) {
-    if (selected.size >= snapshot.watchlist.length + 160) break;
-    selected.set(p.slug, p);
-  }
-  if (selected.size < snapshot.watchlist.length + 160) {
-    for (const p of [...rankable].sort((a, b) => b.tvl_usd - a.tvl_usd || a.slug.localeCompare(b.slug))) {
-      if (selected.size >= snapshot.watchlist.length + 160) break;
-      selected.set(p.slug, p);
-    }
-  }
-  const rows = [...selected.values()].map((p) => {
-    const model = modelInputs(p, snapshot.as_of);
-    return { ...p, ...model, token_status: 'pre-token' as const, farm_steps: templates(family(p.category), p, model), rank: 0 };
-  }).sort((a, b) => b.implied_value_usd - a.implied_value_usd || a.slug.localeCompare(b.slug)).map((row, i) => ({ ...row, rank: i + 1 }));
-  const live_market = snapshot.protocols.filter((p) => !(p.gecko_id === null && p.symbol === null)).map((p) => ({ ...p, ...modelInputs(p, snapshot.as_of), token_status: 'token-bearing' as const })).sort((a, b) => (b.mcap_usd ?? -1) - (a.mcap_usd ?? -1) || a.slug.localeCompare(b.slug));
-  return { rows, live_market };
-}
+export const validateBoard = (rows: BoardRow[], watchlist: string[]): void => {
+  if (rows.length < 100 || rows.length > 200) throw new Error(`Board must contain between 100 and 200 rows, received ${rows.length}`);
+  const slugs = new Set(rows.map((row) => row.slug));
+  if (slugs.size !== rows.length) throw new Error('Board slugs must be unique');
+  rows.forEach((row, index) => {
+    if (row.rank !== index + 1) throw new Error(`Board rank mismatch at index ${index}`);
+    if (index > 0 && row.implied_value_usd > rows[index - 1]!.implied_value_usd) throw new Error('Board implied values must be non-increasing');
+    if (!Number.isInteger(row.implied_value_usd) || row.implied_value_usd < 1) throw new Error(`Invalid implied value for ${row.slug}`);
+    if (row.farm_steps.length !== 7 || row.farm_steps.some((step) => step.length < 20 || step.length > 600 || !step.includes('Cost:') || !step.includes('Time:'))) throw new Error(`Invalid farm plan for ${row.slug}`);
+    const recomputed = impliedValue(row.tvl_usd, row);
+    if (recomputed !== row.implied_value_usd) throw new Error(`Model mismatch for ${row.slug}`);
+  });
+  const missing = watchlist.filter((slug) => !slugs.has(slug));
+  if (missing.length > 0) throw new Error(`Watchlist coverage missing: ${missing.join(', ')}`);
+};
 
-export function validateBoard(rows: BoardRow[], watchlist: string[]): void {
-  if (rows.length < 100 || rows.length > 4000) throw new Error(`board row count ${rows.length} outside gate`);
-  const ranks = rows.map((r) => r.rank);
-  if (ranks.some((r, i) => r !== i + 1)) throw new Error('board ranks are not exactly 1..N');
-  if (rows.some((r, i) => i > 0 && r.implied_value_usd > rows[i - 1]!.implied_value_usd)) throw new Error('board values rise with rank');
-  if (new Set(rows.map((r) => r.implied_value_usd)).size < 2) throw new Error('board values are all equal');
-  if (watchlist.some((slug) => !rows.some((r) => r.slug === slug))) throw new Error('watchlist coverage failed');
-  for (const row of rows) for (const step of row.farm_steps) if (step.trim().length < 20 || step.trim().length > 600) throw new Error(`farm step length failed for ${row.slug}`);
-}
+export const modelValueForRow = (row: Pick<BoardRow, 'tvl_usd' | 'category_factor' | 'growth_factor' | 'downside_factor' | 'age_factor'>): number => impliedValue(row.tvl_usd, row);
+
+export const selectionPredicates = { isPreToken, isVersioned, isRankable, isProductFiltered };
